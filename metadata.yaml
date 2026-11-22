@@ -1,0 +1,4 @@
+name: astrbot_plugin_private_settle
+desc: 私聊话段合并：私聊里补上判官那套「等用户把一口气说完」，连发几条合成一条消息、只回一次（不是只回最后一句）；图片接进同一消息链，不送判官、不加判定。整套 QQ 机器人方案主仓库：github.com/zincvolt/QQNTbotBUTafter261101
+author: local
+version: 1.0.1
