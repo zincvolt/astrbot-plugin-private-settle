@@ -181,9 +181,22 @@ class Main(star.Star):
         self._yielded = 0
         logger.info("[dm] private settle ready (merge mode)")
 
-    @filter.on_waiting_llm_request(priority=maxsize)
+    @filter.event_message_type(
+        filter.EventMessageType.PRIVATE_MESSAGE,
+        priority=maxsize - 1,
+    )
     async def hold_private(self, event: AstrMessageEvent) -> None:
-        """等用户把这一口气说完，再把几段合成一条交给后面的链路。"""
+        """在最前面拦住私聊消息：等用户说完，把连发合成一条再交给后续链路。
+
+        必须挂在**消息事件**（WakingCheckStage）而不是
+        ``on_waiting_llm_request``。框架 4.29 的 follow-up 机制会在
+        ``on_waiting_llm_request`` **之前**执行 ``try_capture_follow_up``：
+        只要该会话还有活跃 agent run，新到达的消息就被注入当前 run 并直接
+        ``return``（见 process_stage/method/agent_sub_stages/internal.py），
+        本插件完全看不到那条消息，于是那一轮自己又回一次——这就是「每句都
+        回」的直接来源。挂在消息事件上先把消息 stop 掉，后面整条 pipeline
+        （含 follow-up）都不会再看到它。
+        """
         cfg = load_config()
         if not cfg["enabled"]:
             return
@@ -195,22 +208,14 @@ class Main(star.Star):
 
         text = (event.message_str or "").strip()
         umo = event.unified_msg_origin
-        if not text:
-            # 纯图片/视频没有文字，本来没有话段概念；但如果这一组正在攒，
-            # 图应该跟着这一组一起回，而不是自己再触发一轮。
-            pics = _images_of(event)
-            st0 = self._pending.get(umo)
-            if pics and st0 is not None and cfg["merge"]:
-                st0["images"].extend(pics)
-                st0["last"] = time.time()
-                if cfg["log"]:
-                    logger.info(
-                        f"[dm] merged {len(pics)} image(s) into #{st0['seq']}"
-                    )
-                event.stop_event()
-            return
+
+        # 斜杠指令必须立刻执行，不能为了等话段慢几秒
         if text[:1] in ("/", "／"):
-            # 指令必须立刻执行，不能为了等话段慢几秒
+            return
+
+        pics = _images_of(event)
+        if not text and not pics:
+            # 戳一戳/系统事件之类：没有话段可合并，放行让框架自己处理
             return
 
         sender = str(event.get_sender_id() or "")
@@ -219,19 +224,21 @@ class Main(star.Star):
 
         now = time.time()
 
-        # 0) 已经有一组在攒：并进去，自己不再回复。窗口由 owner 自己把关——
-        #    这里照收不误，owner 到点会把手里的都发出去，不会丢话。
+        # 0) 已经有一组在攒：并进去，自己不再回复（stop，整条 pipeline 都看不到）。
         st = self._pending.get(umo)
         if st is not None:
             if cfg["merge"]:
-                st["texts"].append(text)
-                st["images"].extend(_images_of(event))
+                if text:
+                    st["texts"].append(text)
+                if pics:
+                    st["images"].extend(pics)
+                st["count"] += 1
                 st["last"] = now
                 self._merged += 1
                 if cfg["log"]:
                     logger.info(
                         f"[dm] merged into #{st['seq']} "
-                        f"({len(st['texts'])} msgs) | {text[:20]}"
+                        f"({st['count']} msgs) | {text[:20] or '[图片]'}"
                     )
                 event.stop_event()
                 return
@@ -242,16 +249,18 @@ class Main(star.Star):
             if cfg["log"]:
                 logger.info(
                     f"[dm] newer message arrived, yield #{st['seq']} "
-                    f"| {text[:20]}"
+                    f"| {text[:20] or '[图片]'}"
                 )
 
-        # 1) 自己当这一组的 owner。
+        # 1) 自己当这一组的 owner。纯图片也建组：否则首张图直接放行、自己触发
+        #    一轮请求，用户连发几张图就会回好几条。
         seq = self._seq.get(umo, 0) + 1
         self._seq[umo] = seq
         st = {
             "seq": seq,
-            "texts": [text],
-            "images": [],
+            "texts": [text] if text else [],
+            "images": [],  # owner 自己的图已在本事件消息链里，只需收别人的
+            "count": 1,
             "last": now,
             "start": now,
             "settle_start": now,
@@ -300,12 +309,15 @@ class Main(star.Star):
                         if cfg["log"]:
                             logger.info(
                                 f"[dm] merge window {window:.0f}s hit, send now "
-                                f"({len(st['texts'])} msgs, "
+                                f"({st['count']} msgs, "
                                 f"quiet={quiet}, gap_ok={gap_ok})"
                             )
                         break
 
-            # 4) 把后到的几段并进本条事件，后面的钩子/请求看到的就是合并结果。
+            # 4) 先把组从 pending 摘掉，再并进本事件。晚于这一步到达的消息会
+            #    新建一组当 owner，不会并进一个已经不再读取的组（不丢话）。
+            if self._pending.get(umo) is st:
+                self._pending.pop(umo, None)
             merged = self._apply_merge(event, st)
             if cfg["log"]:
                 self._waited += 1
@@ -313,7 +325,7 @@ class Main(star.Star):
                 logger.info(
                     f"[dm] {reason} {settle:.1f}s/gap {gap:.0f}s done, reply"
                     f"{tail} (waited {self._waited} / yielded {self._yielded}) "
-                    f"| {text[:24]}"
+                    f"| {text[:24] or '[图片]'}"
                 )
         finally:
             if self._pending.get(umo) is st:
@@ -331,7 +343,7 @@ class Main(star.Star):
         """
         texts: list[str] = st.get("texts") or []
         images: list = st.get("images") or []
-        if len(texts) > 1:
+        if texts:
             merged_text = "\n".join(t for t in texts if t)
             if merged_text:
                 event.message_str = merged_text
@@ -342,8 +354,13 @@ class Main(star.Star):
         if images:
             chain = getattr(getattr(event, "message_obj", None), "message", None)
             if isinstance(chain, list):
-                chain.extend(images)
-        return max(0, len(texts) - 1)
+                # owner 自己的图已经在链里，这里只补后到的，按对象身份去重
+                existing = {id(comp) for comp in chain}
+                for comp in images:
+                    if id(comp) not in existing:
+                        chain.append(comp)
+                        existing.add(id(comp))
+        return max(0, int(st.get("count", 1)) - 1)
 
     def _taken_over(self, umo: str, st: dict) -> bool:
         """这一组是否该让位：被标了 yield，或被后来的组顶替。
