@@ -18,7 +18,9 @@
 5. 斜杠指令、白名单外的人直接放行，不陪等。
 
 ``merge_window`` 是合并上限：用户一直说个不停时最多等到这个秒数就发出去，
-不会无限攒。被合并的消息不进入对话历史，只有合并后的那一条会落库。
+不会无限攒。``min_gap`` 是两次回复的最小间隔：刚回完就来的话会继续攒着，
+避免"你一句我一句"变成一问一答的连珠炮。被合并的消息不进入对话历史，
+只有合并后的那一条会落库。
 
 优先级 ``maxsize``：抢在 basicZ 的 gate 之前跑完，让等待和合并发生在所有
 闸门和 session 锁排队之前；改的是 ``event.message_str``，后面的钩子和
@@ -50,8 +52,9 @@ CMD_CONFIG = Path(r"D:\QQNTBOT\apps\AstrBot\data\cmd_config.json")
 DEFAULTS: dict = {
     "enabled": True,        # 总开关
     "merge": True,          # True=连发合并成一条；False=旧行为，只回最后一条
-    "settle": 3.5,          # 安静多少秒算「这一口气说完了」
-    "merge_window": 15.0,   # 一直说个不停时，最多攒这么久就发
+    "settle": 5.0,          # 安静多少秒算「这一口气说完了」
+    "merge_window": 20.0,   # 一直说个不停时，最多攒这么久就发（硬上限）
+    "min_gap": 10.0,        # 两次回复之间至少隔多久（0=不限）
     "poll": 0.2,            # 轮询间隔
     "inflight_wait": 45.0,  # 上一条还在生成时最多排多久
     "whitelist_only": True, # 只对私聊白名单里的人生效
@@ -100,6 +103,7 @@ def load_config() -> dict:
     # 夹住范围：settle 太大会让每条私聊都慢，太小等于没等
     cfg["settle"] = max(0.0, min(15.0, float(cfg["settle"])))
     cfg["merge_window"] = max(1.0, min(60.0, float(cfg["merge_window"])))
+    cfg["min_gap"] = max(0.0, min(60.0, float(cfg.get("min_gap", 0.0))))
     cfg["poll"] = max(0.05, min(1.0, float(cfg["poll"])))
     cfg["inflight_wait"] = max(0.0, min(120.0, float(cfg["inflight_wait"])))
     _cfg_cache = (mtime, cfg)
@@ -171,6 +175,7 @@ class Main(star.Star):
         self._seq: dict[str, int] = {}        # umo -> 最新组序号
         self._pending: dict[str, dict] = {}   # umo -> 正在攒的那一组
         self._inflight: dict[str, float] = {} # umo -> 生成结束的兜底时间戳
+        self._last_sent: dict[str, float] = {} # umo -> 上一条回复真实发完的时间
         self._waited = 0
         self._merged = 0
         self._yielded = 0
@@ -189,18 +194,29 @@ class Main(star.Star):
             return
 
         text = (event.message_str or "").strip()
+        umo = event.unified_msg_origin
         if not text:
-            # 纯文件/语音：这类消息没有话段概念，直接放行
+            # 纯图片/视频没有文字，本来没有话段概念；但如果这一组正在攒，
+            # 图应该跟着这一组一起回，而不是自己再触发一轮。
+            pics = _images_of(event)
+            st0 = self._pending.get(umo)
+            if pics and st0 is not None and cfg["merge"]:
+                st0["images"].extend(pics)
+                st0["last"] = time.time()
+                if cfg["log"]:
+                    logger.info(
+                        f"[dm] merged {len(pics)} image(s) into #{st0['seq']}"
+                    )
+                event.stop_event()
             return
         if text[:1] in ("/", "／"):
-            # 指令必须立刻执行，不能为了等话段慢 3.5 秒
+            # 指令必须立刻执行，不能为了等话段慢几秒
             return
 
         sender = str(event.get_sender_id() or "")
         if cfg["whitelist_only"] and not _private_allowed(sender):
             return
 
-        umo = event.unified_msg_origin
         now = time.time()
 
         # 0) 已经有一组在攒：并进去，自己不再回复。窗口由 owner 自己把关——
@@ -259,24 +275,33 @@ class Main(star.Star):
                         self._drop(event, st, "inflight")
                         return
 
-            # 3) 等这一口气说完：每次有新消息并入，``last`` 都会往后推。
+            # 3) 等这一口气说完：安静 settle 秒，并且离上次回复至少 min_gap 秒。
+            #    只看「安静」不够——真人打字常常停三四秒再补一句，3.5 秒窗口
+            #    刚过就发出去，下一句永远赶不上（实测差 0.58 秒就各回了一条）。
+            #    加上 min_gap 后，刚回完就来的话会继续攒着，合成一批再回。
             settle = float(cfg["settle"])
+            gap = float(cfg["min_gap"])
             st["settle_start"] = time.time()
             window = float(cfg["merge_window"])
-            if settle > 0:
+            reason = "quiet"
+            if settle > 0 or gap > 0:
                 while True:
                     await asyncio.sleep(poll)
                     if self._taken_over(umo, st):
                         self._drop(event, st, f"settle {settle:.1f}s")
                         return
                     now = time.time()
-                    if now - st["last"] >= settle:
+                    quiet = now - st["last"] >= settle
+                    gap_ok = gap <= 0 or now - self._last_sent.get(umo, 0.0) >= gap
+                    if quiet and gap_ok:
                         break
                     if now - st["settle_start"] >= window:
+                        reason = "window"
                         if cfg["log"]:
                             logger.info(
                                 f"[dm] merge window {window:.0f}s hit, send now "
-                                f"({len(st['texts'])} msgs)"
+                                f"({len(st['texts'])} msgs, "
+                                f"quiet={quiet}, gap_ok={gap_ok})"
                             )
                         break
 
@@ -286,7 +311,7 @@ class Main(star.Star):
                 self._waited += 1
                 tail = f", merged {merged}" if merged else ""
                 logger.info(
-                    f"[dm] settle {settle:.1f}s done, reply"
+                    f"[dm] {reason} {settle:.1f}s/gap {gap:.0f}s done, reply"
                     f"{tail} (waited {self._waited} / yielded {self._yielded}) "
                     f"| {text[:24]}"
                 )
@@ -361,5 +386,9 @@ class Main(star.Star):
     @filter.after_message_sent()
     async def clear_after_send(self, event: AstrMessageEvent) -> None:
         """兜底：消息真的发出去后一定放开，避免标记残留。"""
-        if event.is_private_chat():
-            self._inflight.pop(event.unified_msg_origin, None)
+        if not event.is_private_chat():
+            return
+        umo = event.unified_msg_origin
+        self._inflight.pop(umo, None)
+        # 记下真实发完的时刻，min_gap 用它算「离上次回复多久」
+        self._last_sent[umo] = time.time()
